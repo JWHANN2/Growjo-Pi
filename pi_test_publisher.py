@@ -1,64 +1,45 @@
 #!/usr/bin/env python3
-"""Growjo Raspberry Pi test telemetry publisher."""
+"""Growjo Raspberry Pi soil-sensor MQTT publisher."""
 
 import json
 import logging
-import shutil
 import signal
-import socket
-import subprocess
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-import psutil
-from flask import Flask, send_file
+import minimalmodbus
 import paho.mqtt.client as mqtt
+import serial
 
 
 # MQTT configuration
 MQTT_BROKER_HOST = "192.168.0.107"
 MQTT_BROKER_PORT = 1883
-MQTT_CLIENT_ID = "grow-test-pi01-publisher"
+MQTT_CLIENT_ID = "growjo-pi01-publisher"
 MQTT_KEEPALIVE_SECONDS = 60
 
 # Growjo identity
 SITE = "home"
 ROOM = "testbench"
-DEVICE_ID = "pi01"
+PLANT_ID = "plant01"
+SENSOR_ID = "soil01"
 
-# Topics
-HEARTBEAT_TOPIC = "grow/test/pi01/heartbeat"
-SYSTEM_TOPIC = "grow/test/pi01/system"
-CAMERA_TOPIC = "grow/test/pi01/camera"
+# THE01888S-RS485 Modbus configuration
+SERIAL_PORT = "/dev/ttyUSB0"
+MODBUS_ADDRESS = 1
+MODBUS_BAUDRATE = 9600
+MODBUS_TIMEOUT_SECONDS = 2.0
 
-# Publish intervals
+# Publishing
+HEARTBEAT_TOPIC = f"grow/{SITE}/{ROOM}/heartbeat/status"
+SOIL_TOPIC_PREFIX = f"grow/{SITE}/{ROOM}/soil"
 HEARTBEAT_INTERVAL_SECONDS = 30
-SYSTEM_INTERVAL_SECONDS = 30
-CAMERA_INTERVAL_SECONDS = 60
-
-# Optional camera/web settings
-ENABLE_CAMERA = True
-IMAGE_PATH = Path(__file__).with_name("latest.jpg")
-FLASK_HOST = "0.0.0.0"
-FLASK_PORT = 5000
-CAMERA_COMMAND_TIMEOUT_SECONDS = 20
-
-# Logging
+SENSOR_INTERVAL_SECONDS = 30
 LOG_LEVEL = "INFO"
 
-
 stop_event = threading.Event()
-app = Flask(__name__)
-
-
-@app.route("/latest.jpg")
-def latest_jpg():
-    if not IMAGE_PATH.exists():
-        return ("latest.jpg has not been captured yet\n", 404)
-    return send_file(IMAGE_PATH, mimetype="image/jpeg")
 
 
 def configure_logging() -> None:
@@ -72,101 +53,69 @@ def utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def payload(
-    measurement: str,
-    metric: str,
-    value: Any,
-    unit: str,
-    extra: Optional[dict[str, Any]] = None,
-) -> str:
-    data = {
-        "measurement": measurement,
-        "timestamp": utc_timestamp(),
-        "site": SITE,
-        "room": ROOM,
-        "device_id": DEVICE_ID,
-        "metric": metric,
-        "value": value,
-        "unit": unit,
-    }
-    if extra:
-        data.update(extra)
-    return json.dumps(data, separators=(",", ":"))
-
-
-def get_pi_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect((MQTT_BROKER_HOST, MQTT_BROKER_PORT))
-            return sock.getsockname()[0]
-    except OSError as exc:
-        logging.warning("Could not determine LAN IP address: %s", exc)
-        return socket.gethostname()
+def payload(measurement: str, metric: str, value: Any, unit: str) -> str:
+    return json.dumps(
+        {
+            "measurement": measurement,
+            "timestamp": utc_timestamp(),
+            "site": SITE,
+            "room": ROOM,
+            "plant_id": PLANT_ID,
+            "sensor_id": SENSOR_ID,
+            "metric": metric,
+            "value": value,
+            "unit": unit,
+        },
+        separators=(",", ":"),
+    )
 
 
 def publish(client: mqtt.Client, topic: str, message: str, metric: str) -> None:
-    try:
-        info = client.publish(topic, message, qos=0, retain=False)
-        if info.rc == mqtt.MQTT_ERR_SUCCESS:
-            logging.info("Published metric=%s topic=%s payload=%s", metric, topic, message)
-        else:
-            logging.error("Publish failed metric=%s topic=%s rc=%s", metric, topic, info.rc)
-    except Exception:
-        logging.exception("Publish raised an exception metric=%s topic=%s", metric, topic)
+    info = client.publish(topic, message, qos=0, retain=False)
+    if info.rc == mqtt.MQTT_ERR_SUCCESS:
+        logging.info("Published metric=%s topic=%s payload=%s", metric, topic, message)
+    else:
+        logging.error("Publish failed metric=%s topic=%s rc=%s", metric, topic, info.rc)
 
 
-def read_cpu_temp_c() -> Optional[float]:
-    thermal_path = Path("/sys/class/thermal/thermal_zone0/temp")
-    try:
-        raw = thermal_path.read_text(encoding="utf-8").strip()
-        return round(float(raw) / 1000.0, 2)
-    except Exception as exc:
-        logging.warning("Could not read CPU temperature from %s: %s", thermal_path, exc)
-
-    vcgencmd = shutil.which("vcgencmd")
-    if not vcgencmd:
-        return None
-
-    try:
-        result = subprocess.run(
-            [vcgencmd, "measure_temp"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        value = result.stdout.strip().replace("temp=", "").replace("'C", "")
-        return round(float(value), 2)
-    except Exception as exc:
-        logging.warning("Could not read CPU temperature with vcgencmd: %s", exc)
-        return None
+def create_sensor() -> minimalmodbus.Instrument:
+    instrument = minimalmodbus.Instrument(SERIAL_PORT, MODBUS_ADDRESS, mode=minimalmodbus.MODE_RTU)
+    instrument.serial.baudrate = MODBUS_BAUDRATE
+    instrument.serial.bytesize = 8
+    instrument.serial.parity = serial.PARITY_NONE
+    instrument.serial.stopbits = 1
+    instrument.serial.timeout = MODBUS_TIMEOUT_SECONDS
+    instrument.clear_buffers_before_each_transaction = True
+    return instrument
 
 
-def safe_metric(name: str, func, unit: str) -> Optional[tuple[str, Any, str]]:
-    try:
-        return (name, func(), unit)
-    except Exception:
-        logging.exception("Metric read failed metric=%s", name)
-        return None
+def signed_16(value: int) -> int:
+    return value - 65536 if value >= 32768 else value
 
 
-def system_metrics() -> list[tuple[str, Any, str]]:
-    candidates = [
-        safe_metric("cpu_temp_c", read_cpu_temp_c, "celsius"),
-        safe_metric("cpu_percent", lambda: round(psutil.cpu_percent(interval=None), 2), "percent"),
-        safe_metric("memory_percent", lambda: round(psutil.virtual_memory().percent, 2), "percent"),
-        safe_metric("disk_percent", lambda: round(psutil.disk_usage("/").percent, 2), "percent"),
+def read_soil_metrics(instrument: minimalmodbus.Instrument) -> list[tuple[str, float, str]]:
+    # THE01888S-RS485 exposes its eight live values in holding registers 0x0000-0x0007.
+    registers = instrument.read_registers(0x0000, 8, functioncode=3)
+
+    temperature_c = signed_16(registers[0]) / 10.0
+    moisture_percent = registers[1] / 10.0
+    ec_us_cm = float(registers[2])
+    ph = registers[3] / 100.0
+    nitrogen_mg_kg = float(registers[4])
+    phosphorus_mg_kg = float(registers[5])
+    potassium_mg_kg = float(registers[6])
+    salinity_mg_kg = float(registers[7])
+
+    return [
+        ("temperature_c", temperature_c, "celsius"),
+        ("moisture_percent", moisture_percent, "percent"),
+        ("ec_us_cm", ec_us_cm, "uS/cm"),
+        ("ph", ph, "pH"),
+        ("nitrogen_mg_kg", nitrogen_mg_kg, "mg/kg"),
+        ("phosphorus_mg_kg", phosphorus_mg_kg, "mg/kg"),
+        ("potassium_mg_kg", potassium_mg_kg, "mg/kg"),
+        ("salinity_mg_kg", salinity_mg_kg, "mg/kg"),
     ]
-    metrics: list[tuple[str, Any, str]] = []
-    for item in candidates:
-        if item is None:
-            continue
-        name, value, unit = item
-        if value is None:
-            logging.warning("Skipping unavailable metric=%s", name)
-            continue
-        metrics.append((name, value, unit))
-    return metrics
 
 
 def heartbeat_loop(client: mqtt.Client) -> None:
@@ -175,82 +124,27 @@ def heartbeat_loop(client: mqtt.Client) -> None:
         stop_event.wait(HEARTBEAT_INTERVAL_SECONDS)
 
 
-def system_loop(client: mqtt.Client) -> None:
-    psutil.cpu_percent(interval=None)
-    while not stop_event.is_set():
-        for metric, value, unit in system_metrics():
-            publish(client, SYSTEM_TOPIC, payload("system", metric, value, unit), metric)
-        stop_event.wait(SYSTEM_INTERVAL_SECONDS)
-
-
-def camera_command() -> Optional[list[str]]:
-    for command_name in ("rpicam-still", "libcamera-still"):
-        command = shutil.which(command_name)
-        if command:
-            return [
-                command,
-                "--nopreview",
-                "--timeout",
-                "1000",
-                "--output",
-                str(IMAGE_PATH),
-            ]
-    return None
-
-
-def camera_available(command: list[str]) -> bool:
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=CAMERA_COMMAND_TIMEOUT_SECONDS,
-        )
-        if result.returncode == 0 and IMAGE_PATH.exists():
-            logging.info("Camera detected and initial image captured at %s", IMAGE_PATH)
-            return True
-        logging.warning(
-            "Camera capture test failed rc=%s stderr=%s",
-            result.returncode,
-            result.stderr.strip(),
-        )
-    except Exception as exc:
-        logging.warning("Camera capture test failed: %s", exc)
-    return False
-
-
-def flask_loop() -> None:
-    logging.info("Serving latest camera image on http://%s:%s/latest.jpg", get_pi_ip(), FLASK_PORT)
-    app.run(host=FLASK_HOST, port=FLASK_PORT, threaded=True, use_reloader=False)
-
-
-def camera_loop(client: mqtt.Client, command: list[str], image_url: str) -> None:
+def sensor_loop(client: mqtt.Client) -> None:
+    instrument = None
     while not stop_event.is_set():
         try:
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=CAMERA_COMMAND_TIMEOUT_SECONDS,
-            )
-            if result.returncode == 0:
-                publish(
-                    client,
-                    CAMERA_TOPIC,
-                    payload("camera", "image_url", image_url, "url", {"image_url": image_url}),
-                    "image_url",
+            if instrument is None:
+                instrument = create_sensor()
+                logging.info(
+                    "Opened soil sensor port=%s address=%s baud=%s",
+                    SERIAL_PORT,
+                    MODBUS_ADDRESS,
+                    MODBUS_BAUDRATE,
                 )
-            else:
-                logging.error(
-                    "Camera capture failed rc=%s stderr=%s",
-                    result.returncode,
-                    result.stderr.strip(),
-                )
+
+            for metric, value, unit in read_soil_metrics(instrument):
+                topic = f"{SOIL_TOPIC_PREFIX}/{metric}"
+                publish(client, topic, payload("soil", metric, value, unit), metric)
         except Exception:
-            logging.exception("Camera capture raised an exception")
-        stop_event.wait(CAMERA_INTERVAL_SECONDS)
+            logging.exception("Soil sensor read failed; will retry")
+            instrument = None
+
+        stop_event.wait(SENSOR_INTERVAL_SECONDS)
 
 
 def connect_mqtt() -> mqtt.Client:
@@ -286,19 +180,8 @@ def main() -> int:
     client = connect_mqtt()
     threads = [
         start_thread("heartbeat", heartbeat_loop, client),
-        start_thread("system", system_loop, client),
+        start_thread("soil-sensor", sensor_loop, client),
     ]
-
-    if ENABLE_CAMERA:
-        command = camera_command()
-        if command and camera_available(command):
-            pi_ip = get_pi_ip()
-            image_url = f"http://{pi_ip}:{FLASK_PORT}/latest.jpg"
-            threads.append(start_thread("flask", flask_loop))
-            threads.append(start_thread("camera", camera_loop, client, command, image_url))
-            logging.info("Camera publishing enabled image_url=%s", image_url)
-        else:
-            logging.info("No supported camera detected; continuing without camera publishing")
 
     try:
         while not stop_event.is_set():
@@ -309,7 +192,7 @@ def main() -> int:
             thread.join(timeout=2)
         client.loop_stop()
         client.disconnect()
-        logging.info("Stopped Growjo Pi test publisher")
+        logging.info("Stopped Growjo Pi publisher")
     return 0
 
 
