@@ -1,37 +1,50 @@
-# Growjo Raspberry Pi Test Publisher
+# Growjo Raspberry Pi Soil Sensor Publisher
 
-Publishes Raspberry Pi test telemetry to the Growjo MQTT broker on Raspberry Pi OS Bookworm.
+Reads the Yieryi THE01888S-RS485 8-in-1 soil sensor over Modbus RTU and publishes the readings to the Growjo MQTT broker.
 
-## MQTT Topics
+## Data path
 
-- `grow/test/pi01/heartbeat`
-- `grow/test/pi01/system`
-- `grow/test/pi01/camera`
+`THE01888S-RS485 -> USB/RS485 adapter -> Raspberry Pi -> MQTT -> Growjo server -> Telegraf -> InfluxDB`
 
-## Payload Shape
+## Sensor defaults
 
-All telemetry is JSON:
+- Serial device: `/dev/ttyUSB0`
+- Modbus address: `1`
+- Baud: `9600`
+- Format: `8N1`
+- Function: holding-register read (`0x03`)
+- Live registers: `0x0000` through `0x0007`
 
-```json
-{
-  "measurement": "system",
-  "timestamp": "2026-04-25T12:00:00+00:00",
-  "site": "home",
-  "room": "testbench",
-  "device_id": "pi01",
-  "metric": "cpu_percent",
-  "value": 12.5,
-  "unit": "percent"
-}
+The publisher reads temperature, moisture, EC, pH, nitrogen, phosphorus, potassium, and salinity every 30 seconds.
+
+## MQTT topics
+
+Readings are published under:
+
 ```
+grow/home/testbench/soil/temperature_c
+grow/home/testbench/soil/moisture_percent
+grow/home/testbench/soil/ec_us_cm
+grow/home/testbench/soil/ph
+grow/home/testbench/soil/nitrogen_mg_kg
+grow/home/testbench/soil/phosphorus_mg_kg
+grow/home/testbench/soil/potassium_mg_kg
+grow/home/testbench/soil/salinity_mg_kg
+```
+
+Heartbeat:
+
+```
+grow/home/testbench/heartbeat/status
+```
+
+Each payload includes `site`, `room`, `plant_id`, `sensor_id`, `metric`, `value`, and `unit`.
 
 ## Install
 
-On the Raspberry Pi:
-
 ```bash
 sudo apt update
-sudo apt install -y python3-venv python3-pip rpicam-apps
+sudo apt install -y python3-venv python3-pip
 sudo mkdir -p /opt/growjo-pi-test-publisher
 sudo cp pi_test_publisher.py requirements.txt growjo-pi-test-publisher.service /opt/growjo-pi-test-publisher/
 sudo chown -R pi:pi /opt/growjo-pi-test-publisher
@@ -41,80 +54,48 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-If your Pi image uses `libcamera-still` instead of `rpicam-still`, install the camera package available for that image. The publisher supports both commands.
+## Find the USB/RS485 adapter
 
-## Configure
+After plugging the adapter into the Pi:
 
-Configuration variables are at the top of `pi_test_publisher.py`.
-
-Default broker:
-
-```python
-MQTT_BROKER_HOST = "192.168.0.107"
-MQTT_BROKER_PORT = 1883
+```bash
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 ```
 
-Default identity:
+The default code expects `/dev/ttyUSB0`. Change `SERIAL_PORT` in `pi_test_publisher.py` if your adapter appears under a different device.
 
-```python
-SITE = "home"
-ROOM = "testbench"
-DEVICE_ID = "pi01"
+The service user must have serial-port access. On Raspberry Pi OS this is normally the `dialout` group:
+
+```bash
+sudo usermod -aG dialout pi
 ```
 
-## Manual Test
+Log out/reboot after changing group membership.
 
-Run the publisher in the foreground:
+## Manual test
 
 ```bash
 cd /opt/growjo-pi-test-publisher
 .venv/bin/python pi_test_publisher.py
 ```
 
-Watch MQTT messages from another terminal:
+Watch MQTT from another machine:
 
 ```bash
-sudo apt install -y mosquitto-clients
-mosquitto_sub -h 192.168.0.107 -p 1883 -t 'grow/test/pi01/#' -v
+mosquitto_sub -h 192.168.0.107 -p 1883 -t 'grow/home/testbench/#' -v
 ```
 
-Test camera image serving if a camera is detected:
-
-```bash
-curl -I http://localhost:5000/latest.jpg
-```
-
-The publisher continues heartbeat and system telemetry if no camera is detected.
-
-## Systemd Service
-
-Install the service file:
+## Systemd
 
 ```bash
 sudo cp /opt/growjo-pi-test-publisher/growjo-pi-test-publisher.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable growjo-pi-test-publisher.service
-sudo systemctl start growjo-pi-test-publisher.service
-```
-
-Check status and logs:
-
-```bash
-systemctl status growjo-pi-test-publisher.service
+sudo systemctl enable --now growjo-pi-test-publisher.service
 journalctl -u growjo-pi-test-publisher.service -f
-```
-
-Stop or restart:
-
-```bash
-sudo systemctl stop growjo-pi-test-publisher.service
-sudo systemctl restart growjo-pi-test-publisher.service
 ```
 
 ## Notes
 
-- Heartbeat publishes every 30 seconds.
-- System metrics publish every 30 seconds.
-- Camera capture publishes every 60 seconds when `rpicam-still` or `libcamera-still` can capture an image.
-- Camera images are served from `http://<pi-ip>:5000/latest.jpg`.
-- Individual metric failures are logged and skipped without stopping the process.
+- The old CPU/memory/disk telemetry has been removed. The Pi now publishes actual soil-sensor readings plus a heartbeat.
+- If Modbus reads time out, verify sensor power and serial device first. If power is correct, swapping RS485 A/B is a normal troubleshooting step.
+- NPK values from this class of multi-parameter probe are best treated as trend/reference values rather than laboratory nutrient analysis.
