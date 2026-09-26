@@ -1,12 +1,12 @@
 [Unit]
-Description=Growjo Raspberry Pi test telemetry publisher
+Description=Growjo Raspberry Pi soil sensor publisher
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-Group=pi
+User=joewhann
+Group=joewhann
 WorkingDirectory=/opt/growjo-pi-test-publisher
 ExecStart=/opt/growjo-pi-test-publisher/.venv/bin/python /opt/growjo-pi-test-publisher/pi_test_publisher.py
 Restart=always
